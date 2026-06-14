@@ -1,0 +1,568 @@
+<script>
+/* ============ helpers ============ */
+function call(fn){
+  var args = Array.prototype.slice.call(arguments, 1);
+  return new Promise(function(resolve, reject){
+    var runner = google.script.run.withSuccessHandler(resolve).withFailureHandler(reject);
+    runner[fn].apply(runner, args);
+  });
+}
+function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g,function(c){
+  return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'})[c]; }); }
+function errMsg(e){ return (e && e.message) ? e.message : String(e); }
+function $(id){ return document.getElementById(id); }
+function app(){ return $('app'); }
+function showOverlay(msg){ $('overlayMsg').textContent = msg||'Loading…'; $('overlay').style.display='flex'; }
+function hideOverlay(){ $('overlay').style.display='none'; }
+function toast(msg, kind){
+  kind = kind || 'primary';
+  // Translate toast kinds to premium background colors if bootstrap colors aren't enough
+  var el = document.createElement('div');
+  el.className = 'toast align-items-center text-bg-'+kind+' border-0 show';
+  el.innerHTML = '<div class="d-flex"><div class="toast-body">'+esc(msg)+
+    '</div><button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast"></button></div>';
+  $('toasts').appendChild(el);
+  setTimeout(function(){ el.remove(); }, 4500);
+}
+function fmtDT(iso){
+  if(!iso) return '—';
+  var d = new Date(iso);
+  if(isNaN(d.getTime())) return esc(iso);
+  return d.toLocaleString(undefined,{weekday:'short',day:'2-digit',month:'short',
+    year:'numeric',hour:'2-digit',minute:'2-digit'});
+}
+function pill(done){ return done ? '<span class="pill done">Submitted</span>'
+                                 : '<span class="pill wait">Pending</span>'; }
+/* Clickable "Submitted" pill that opens the feedback viewer. */
+function fbPill(done, row){
+  return done
+    ? '<span class="pill done" style="cursor:pointer" title="View feedback" onclick="viewFeedback('+row+')">Submitted <i class="bi bi-eye ms-1"></i></span>'
+    : '<span class="pill wait">Pending</span>';
+}
+function isCompleted(s){ return s.datetime && new Date(s.datetime) < new Date(); }
+function isUpcoming(s){ return s.datetime && new Date(s.datetime) >= new Date(); }
+function studentDone(s){ return !!(s.studentFeedback && s.studentRating); }
+function mentorDone(s){ return !!(s.mentorFeedback && s.mentorRating); }
+/* Split a session list into upcoming (soonest first) and past (most recent first). */
+function upcomingSessions(list){
+  return list.filter(isUpcoming).slice().sort(function(a,b){
+    return new Date(a.datetime) - new Date(b.datetime); });
+}
+function pastSessions(list){
+  return list.filter(function(s){ return s.datetime && new Date(s.datetime) < new Date(); });
+}
+/* Booking status badge — derived from the session date (no DB column needed). */
+function statusBadge(s){
+  if(!s.datetime) return '<span class="pill wait">—</span>';
+  return isCompleted(s)
+    ? '<span class="pill done">Completed</span>'
+    : '<span class="pill" style="background:rgba(96,165,250,.15);color:#93c5fd;">Upcoming</span>';
+}
+/* ============ state ============ */
+var STATE = { student:null, sessions:[], summary:null, mentors:null };
+/* ============ boot ============ */
+document.addEventListener('DOMContentLoaded', function(){
+  wireNav(); wireModals();
+  if (INIT.view === 'mentor-feedback' && INIT.sid){ renderMentorFeedback(INIT.sid); return; }
+  loadDashboard();
+});
+/* Google sign-out + return to the app (lets you switch accounts). */
+function logoutUrl(){
+  var appUrl = (typeof INIT!=='undefined' && INIT.webAppUrl) ? INIT.webAppUrl : '';
+  return 'https://www.google.com/accounts/Logout?continue=https://appengine.google.com/_ah/logout?continue=' + encodeURIComponent(appUrl);
+}
+function wireNav(){
+  document.querySelectorAll('[data-nav]').forEach(function(a){
+    a.addEventListener('click', function(e){ e.preventDefault(); showView(a.dataset.nav); });
+  });
+  var lb = $('logoutBtn');
+  if (lb){ lb.href = logoutUrl(); lb.setAttribute('target','_top'); }
+}
+async function loadDashboard(){
+  showOverlay('Signing you in…');
+  try{
+    var data = await call('getDashboardData');
+    if (!data.authorized){ hideOverlay(); return renderAccessDenied(data.email); }
+    STATE.student = data.student; STATE.sessions = data.sessions; STATE.summary = data.summary;
+    $('appNav').style.display = '';
+    $('navUser').innerHTML =
+      '<span style="display:inline-flex;align-items:center;gap:9px;padding:5px 12px;border-radius:999px;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.08);">'+
+        '<i class="bi bi-person-circle text-primary" style="font-size:1.35rem;"></i>'+
+        '<span style="display:inline-flex;flex-direction:column;line-height:1.15;text-align:left;">'+
+          '<span class="text-white" style="font-weight:600;font-size:.85rem;">'+esc(data.student.name)+'</span>'+
+          '<span class="text-muted" style="font-size:.7rem;">'+esc(data.student.email)+'</span>'+
+        '</span>'+
+      '</span>';
+    showView('dashboard');
+  }catch(e){ toast(errMsg(e),'danger'); }
+  finally{ hideOverlay(); }
+}
+function showView(name){
+  document.querySelectorAll('[data-nav]').forEach(function(a){
+    a.classList.toggle('active', a.dataset.nav===name); });
+  if (name==='dashboard') renderDashboard();
+  else if (name==='mentors') renderMentors();
+  else if (name==='history') renderHistory();
+  window.scrollTo(0,0);
+}
+/* ============ Access denied ============ */
+function renderAccessDenied(email){
+  $('appNav').style.display='none';
+  app().innerHTML =
+    '<div class="card access-denied text-center p-4">'+
+    '<div class="display-1"><i class="bi bi-shield-lock-fill"></i></div>'+
+    '<h3 class="mt-2 text-white">Access Denied</h3>'+
+    '<p class="text-muted mt-3">The account <b class="text-white">'+esc(email||'')+'</b> is not registered as a student in this portal.</p>'+
+    '<p class="text-muted small mt-2">Please sign in with your registered student Google account.</p>'+
+    '<a class="btn btn-outline-light mt-3" target="_top" href="'+logoutUrl()+'"><i class="bi bi-box-arrow-right me-2"></i>Sign in with a different account</a>'+
+    '</div>';
+}
+/* ============ Dashboard ============ */
+function renderDashboard(){
+  var s = STATE.student, sum = STATE.summary;
+  var up = upcomingSessions(STATE.sessions);
+  var pa = pastSessions(STATE.sessions);
+  var html =
+    '<div class="card welcome-card p-4 mb-4">'+
+      '<div class="display-6">Welcome, '+esc(s.name)+' 👋</div>'+
+      '<div class="mt-2 opacity-75">Roll Number: <b class="text-white">'+esc(s.roll)+'</b> &nbsp;•&nbsp; Batch: <b class="text-white">'+esc(s.batch)+'</b></div>'+
+    '</div>'+
+    '<div class="row g-3 mb-4">'+
+      statTile('bi-collection','Total Sessions', sum.total)+
+      statTile('bi-check2-circle','Completed', sum.completed)+
+      statTile('bi-exclamation-circle','Pending Feedback', sum.pendingFeedback)+
+    '</div>'+
+    '<div class="d-flex justify-content-between align-items-center mt-5 mb-3">'+
+      '<h5 class="section-title mb-0"><i class="bi bi-calendar-event me-2"></i>Upcoming Sessions</h5>'+
+      '<button class="btn btn-primary btn-sm px-4" onclick="showView(\'mentors\')"><i class="bi bi-plus-lg me-2"></i>Book a Session</button>'+
+    '</div>'+
+    sessionsTable(up, true, 'No upcoming sessions. Book one to get started.')+
+    '<div class="d-flex justify-content-between align-items-center mt-5 mb-3">'+
+      '<h5 class="section-title mb-0"><i class="bi bi-clock-history me-2"></i>Past Sessions</h5>'+
+    '</div>'+
+    sessionsTable(pa, true, 'No past sessions yet.');
+  app().innerHTML = html;
+}
+function statTile(icon, label, num){
+  return '<div class="col-12 col-md-4"><div class="card stat p-4 h-100">'+
+    '<div class="d-flex align-items-center">'+
+      '<div class="d-flex align-items-center justify-content-center bg-white bg-opacity-10 border border-white border-opacity-10 rounded-4 me-3" style="width: 56px; height: 56px;">'+
+        '<i class="bi '+icon+' fs-3" style="background: var(--gradient-brand); -webkit-background-clip: text; -webkit-text-fill-color: transparent;"></i>'+
+      '</div>'+
+      '<div>'+
+        '<div class="num">'+num+'</div>'+
+        '<div class="lbl">'+label+'</div>'+
+      '</div>'+
+    '</div>'+
+  '</div></div>';
+}
+function sessionsTable(list, withFeedbackAction, emptyMsg){
+  if (!list.length) return '<div class="card mt-3"><div class="empty"><i class="bi bi-calendar-x fs-1 d-block mb-3"></i>'+esc(emptyMsg||'No sessions found. Book a session to get started.')+'</div></div>';
+  var rows = list.map(function(s){
+    var meet = s.meetLink ? '<a class="meet-link" href="'+esc(s.meetLink)+'" target="_blank"><i class="bi bi-camera-video me-2"></i>Join</a>' : '—';
+    var fbBtn = (withFeedbackAction && (s.studentCompleted || isCompleted(s)) && !studentDone(s))
+      ? ' <button class="btn btn-sm btn-outline-primary ms-2 py-1 px-3" style="font-size: 0.8rem;" onclick=\'openFeedbackRow('+s.row+",\""+escAttr(s.sessionNo)+'")\'><i class="bi bi-chat-heart me-1"></i>Feedback</button>' : '';
+    var completeAction = (!s.studentCompleted)
+      ? ' <button class="btn btn-sm btn-outline-light ms-1 py-1 px-2" style="font-size:.72rem;" onclick="markComplete('+s.row+')"><i class="bi bi-check2-circle me-1"></i>Mark complete</button>'
+      : (s.studentCompleted && !mentorDone(s) ? ' <span class="text-muted" style="font-size:.72rem;">· awaiting mentor feedback</span>' : '');
+    return '<tr>'+
+      '<td><b>'+esc(s.sessionNo)+'</b></td>'+
+      '<td class="fw-semibold text-white">'+esc(s.mentor)+'</td>'+
+      '<td>'+fmtDT(s.datetime)+'</td>'+
+      '<td>'+statusBadge(s)+completeAction+'</td>'+
+      '<td>'+meet+'</td>'+
+      '<td>'+fbPill(studentDone(s), s.row)+fbBtn+'</td>'+
+      '<td>'+fbPill(mentorDone(s), s.row)+
+        (!mentorDone(s) ? ' <button class="btn btn-sm btn-outline-warning ms-1 py-1 px-2" style="font-size:.72rem;" onclick="remindMentor('+s.row+')"><i class="bi bi-bell me-1"></i>Remind</button>' : '')+
+      '</td>'+
+    '</tr>';
+  }).join('');
+  return '<div class="card mt-3"><div class="table-responsive">'+
+    '<table class="table align-middle mb-0" style="--bs-table-bg:transparent;--bs-table-color:#e8e8ef;--bs-table-border-color:rgba(255,255,255,.08);color:#e8e8ef;">'+
+    '<thead><tr><th>#</th><th>Mentor</th><th>Date &amp; Time</th><th>Status</th><th>Meet</th>'+
+    '<th>Student Feedback</th><th>Mentor Feedback</th></tr></thead><tbody>'+rows+'</tbody></table></div></div>';
+}
+function escAttr(s){ return String(s==null?'':s).replace(/'/g,"\\'").replace(/"/g,'&quot;'); }
+/* ============ Mentors ============ */
+async function renderMentors(){
+  var searchHtml =
+    '<div class="d-flex flex-wrap justify-content-between align-items-center gap-3 mb-4">' +
+      '<div>' +
+        '<h5 class="section-title mb-1">Choose a Mentor</h5>' +
+        '<div class="text-muted small">Browse and book a 1:1 mentorship session</div>' +
+      '</div>' +
+      '<div style="position:relative;flex:1;min-width:240px;max-width:440px;">' +
+        '<i class="bi bi-search" style="position:absolute;left:16px;top:50%;transform:translateY(-50%);color:#8b93a3;font-size:.95rem;pointer-events:none;"></i>' +
+        '<input type="text" id="mentorSearch" class="form-control form-control-dark" placeholder="Search by name, skills, organization, role…" oninput="filterMentors()" ' +
+          'style="padding:0 16px 0 44px;height:48px;border-radius:14px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.10);">' +
+      '</div>' +
+    '</div>' +
+    '<div id="mentorGrid" class="row g-3"></div>';
+
+  app().innerHTML = searchHtml;
+  if (!STATE.mentors){
+    $('mentorGrid').innerHTML = loaderRow();
+    try{ STATE.mentors = await call('getMentors'); }
+    catch(e){ $('mentorGrid').innerHTML=''; return toast(errMsg(e),'danger'); }
+  }
+  if (!STATE.mentors.length){ $('mentorGrid').innerHTML = '<div class="empty">No mentors available.</div>'; return; }
+
+  filterMentors();
+}
+function filterMentors(){
+  var query = ($('mentorSearch') ? $('mentorSearch').value : '').toLowerCase().trim();
+  var grid = $('mentorGrid');
+  if(!grid) return;
+
+  if (!STATE.mentors || !STATE.mentors.length){
+    grid.innerHTML = '<div class="empty">No mentors available.</div>';
+    return;
+  }
+
+  var filtered = STATE.mentors.filter(function(m){
+    if(!query) return true;
+    var name = (m.name||'').toLowerCase();
+    var skills = (m.skills||'').toLowerCase();
+    var org = (m.org||'').toLowerCase();
+    var role = (m.role||'').toLowerCase();
+    var stream = (m.stream||'').toLowerCase();
+    var university = (m.university||'').toLowerCase();
+
+    return name.indexOf(query) !== -1 ||
+           skills.indexOf(query) !== -1 ||
+           org.indexOf(query) !== -1 ||
+           role.indexOf(query) !== -1 ||
+           stream.indexOf(query) !== -1 ||
+           university.indexOf(query) !== -1;
+  });
+
+  if(!filtered.length){
+    grid.innerHTML = '<div class="empty"><i class="bi bi-search fs-1 d-block mb-3 text-muted"></i>No mentors match your search query. Try another keyword!</div>';
+    return;
+  }
+
+  grid.innerHTML = filtered.map(mentorCard).join('');
+}
+function loaderRow(){ return '<div class="col-12 d-flex justify-content-center py-5"><div class="custom-loader"></div></div>'; }
+function mentorCard(m){
+  var photo = m.photo ? '<img class="mentor-photo" src="'+esc(m.photo)+'" onerror="this.onerror=null; this.src=\'\';">'
+                      : '<div class="mentor-photo d-flex align-items-center justify-content-center text-muted"><i class="bi bi-person fs-2"></i></div>';
+  var skills = (m.skills||'').split(/[,;]/).filter(function(x){return x.trim();})
+    .slice(0,6).map(function(x){ return '<span class="skill-chip">'+esc(x.trim())+'</span>'; }).join('');
+  var portfolioBtn = m.portfolio ? '<a class="btn btn-sm btn-outline-secondary" href="'+esc(m.portfolio)+'" target="_blank" title="Portfolio"><i class="bi bi-globe"></i></a>' : '';
+  var linkedinBtn = m.linkedin ? '<a class="btn btn-sm btn-outline-primary" href="'+esc(m.linkedin)+'" target="_blank" title="LinkedIn"><i class="bi bi-linkedin"></i></a>' : '';
+
+  return '<div class="col-12 col-md-6 col-lg-4">' +
+    '<div class="card mentor-card">' +
+      '<div class="d-flex align-items-start mb-3">' +
+        '<div class="mentor-photo-container">' +
+          photo +
+        '</div>' +
+        '<div class="ms-3 flex-grow-1">' +
+          '<div class="mentor-name">' + esc(m.name) + '</div>' +
+          '<div class="mentor-meta text-truncate" style="max-width:180px;" title="' + esc(m.role||'') + (m.org ? ' @ ' + esc(m.org) : '') + '">' +
+            esc(m.role||'') + (m.org ? ' · <span class="text-white opacity-75">' + esc(m.org) + '</span>' : '') +
+          '</div>' +
+        '</div>' +
+      '</div>' +
+      '<div class="mentor-details-row"><i class="bi bi-mortarboard-fill"></i>' + esc(m.university || '—') + '</div>' +
+      '<div class="mentor-details-row"><i class="bi bi-briefcase-fill"></i>' + esc(m.exp || '—') + ' Experience</div>' +
+      '<div class="skills-wrapper">' + skills + '</div>' +
+      '<div class="mt-auto pt-3 border-top border-white border-opacity-5 d-flex gap-2 align-items-center">' +
+        linkedinBtn +
+        portfolioBtn +
+        '<button class="btn btn-sm btn-primary ms-auto px-4 py-2" onclick=\'onBookClick("' + escAttr(m.id) + '")\'><i class="bi bi-calendar-plus-fill me-2"></i>Book Session</button>' +
+      '</div>' +
+    '</div>' +
+  '</div>';
+}
+/* ============ History ============ */
+function renderHistory(){
+  app().innerHTML = '<h5 class="section-title"><i class="bi bi-clock-history me-2"></i>Session History</h5>' +
+    sessionsTable(STATE.sessions, true, 'No sessions yet. Your full booking history will appear here.');
+}
+/* ============ Booking ============ */
+var bookModal, fbModal, fbViewModal;
+function wireModals(){
+  bookModal = new bootstrap.Modal($('bookModal'));
+  fbModal = new bootstrap.Modal($('fbModal'));
+  fbViewModal = new bootstrap.Modal($('fbViewModal'));
+  $('bookConfirm').addEventListener('click', confirmBooking);
+  $('fbSubmit').addEventListener('click', submitFeedback);
+  buildStars('fbStars','fbRating');
+}
+/* View submitted feedback (yours + the mentor's) for a session. */
+function viewFeedback(row){
+  var s = (STATE.sessions||[]).find(function(x){ return String(x.row)===String(row); });
+  if(!s) return;
+  $('fbViewTitle').textContent = s.sessionNo + ' · ' + s.mentor;
+  $('fbViewBody').innerHTML =
+    fbBlock('Your feedback', s.studentFeedback, s.studentRating) +
+    fbBlock('Mentor’s feedback', s.mentorFeedback, s.mentorRating);
+  fbViewModal.show();
+}
+function fbBlock(label, text, rating){
+  var r = Number(rating) || 0, stars = '';
+  for (var i=1;i<=5;i++) stars += '<i class="bi bi-star-fill" style="font-size:1.05rem;margin-right:3px;color:'+(i<=r?'#fbbf24':'rgba(255,255,255,.16)')+'"></i>';
+  return '<div style="margin-bottom:14px;padding:16px 18px;border-radius:16px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.10);">'+
+    '<div style="font-size:.72rem;font-weight:600;letter-spacing:.06em;color:#8b93a3;margin-bottom:10px;">'+esc(label).toUpperCase()+'</div>'+
+    (text ? '<div style="color:#e8eaf0;line-height:1.55;margin-bottom:12px;">&ldquo;'+esc(text)+'&rdquo;</div>'
+          : '<div style="color:#7b8394;font-style:italic;margin-bottom:12px;">Not submitted yet.</div>')+
+    (r ? '<div style="display:flex;align-items:center;gap:8px;">'+stars+'<span style="color:#9aa3b2;font-size:.85rem;">'+r+'/5</span></div>' : '')+
+    '</div>';
+}
+async function onBookClick(mentorId){
+  showOverlay('Checking eligibility…');
+  try{
+    var gate = await call('canBook');
+    hideOverlay();
+    if (!gate.allowed){
+      toast('Submit feedback for your previous session before booking again.','warning');
+      return openFeedbackRow(gate.pending.row, gate.pending.sessionNo);
+    }
+    openBooking(mentorId);
+  }catch(e){ hideOverlay(); toast(errMsg(e),'danger'); }
+}
+var BOOK_SLOTS = [];
+async function openBooking(mentorId){
+  var m = (STATE.mentors||[]).find(function(x){ return String(x.id)===String(mentorId); });
+  $('bookMentorId').value = mentorId;
+  $('bookMentorName').textContent = m ? m.name : ('#'+mentorId);
+  $('bookMentorRole').textContent = m ? ((m.role||'') + (m.org ? ' · ' + m.org : '')) : '';
+  $('bookMentorPhoto').innerHTML = (m && m.photo)
+    ? '<img src="'+esc(m.photo)+'" style="width:100%;height:100%;object-fit:cover;">'
+    : '<i class="bi bi-person fs-4 text-muted"></i>';
+  $('bookSlotIso').value = '';
+  $('bookError').textContent = '';
+  $('bookDate').value = '';
+  $('availDays').textContent = '';
+  BOOK_SLOTS = [];
+  $('bookSlots').innerHTML = '<div class="text-muted small py-2"><span class="spinner-border spinner-border-sm me-2"></span>Loading availability…</div>';
+  bookModal.show();
+  try{
+    BOOK_SLOTS = (await call('getMentorSlots', mentorId)) || [];
+    if (!BOOK_SLOTS.length){
+      $('bookSlots').innerHTML = '<div class="text-muted small py-4 text-center border border-white border-opacity-10 rounded-4">'+
+        '<i class="bi bi-calendar-x d-block fs-4 mb-2"></i>This mentor hasn\'t shared any available slots yet.</div>';
+      return;
+    }
+    var dates = BOOK_SLOTS.map(function(s){ return s.date; });
+    $('bookDate').min = dates[0];
+    $('bookDate').max = dates[dates.length-1];
+    var dows = {};
+    BOOK_SLOTS.forEach(function(s){ dows[new Date(s.iso).toLocaleDateString(undefined,{weekday:'long'})] = true; });
+    $('availDays').innerHTML = '<span style="font-size:.72rem;color:#8b93a3;">Available on:</span> '+
+      Object.keys(dows).map(function(d){ return '<span style="display:inline-block;background:rgba(124,131,253,.16);color:#b9bdff;font-size:.72rem;font-weight:600;padding:2px 10px;border-radius:999px;margin:3px 4px 0 0;">'+esc(d)+'</span>'; }).join('');
+    $('bookDate').value = dates[0];       // preselect the first available date
+    renderSlotsForDate();
+  }catch(e){
+    $('bookSlots').innerHTML = '<div class="text-danger small">'+esc(errMsg(e))+'</div>';
+  }
+}
+function renderSlotsForDate(){
+  var d = $('bookDate').value;
+  $('bookSlotIso').value = '';
+  var box = $('bookSlots');
+  if (!d){ box.innerHTML = '<div class="text-muted small py-2">Pick a date to see slots.</div>'; return; }
+  var todays = BOOK_SLOTS.filter(function(s){ return s.date === d; });
+  if (!todays.length){
+    box.innerHTML = '<div class="text-muted small py-3">No slots on this date — pick one of the available days listed above.</div>';
+    return;
+  }
+  box.innerHTML = '<div class="d-flex flex-wrap gap-2">'+ todays.map(function(s){
+    var t = new Date(s.iso).toLocaleTimeString(undefined,{hour:'2-digit',minute:'2-digit'});
+    return '<button type="button" class="btn btn-outline-primary slot-btn px-4 py-2" style="border-radius:12px;font-weight:600;" data-iso="'+esc(s.iso)+'" onclick="pickSlot(this)"><i class="bi bi-clock me-2"></i>'+esc(t)+'</button>';
+  }).join('') +'</div>';
+}
+function pickSlot(btn){
+  document.querySelectorAll('#bookSlots .slot-btn').forEach(function(b){
+    b.classList.remove('btn-primary'); b.classList.add('btn-outline-primary'); });
+  btn.classList.remove('btn-outline-primary'); btn.classList.add('btn-primary');
+  $('bookSlotIso').value = btn.dataset.iso;
+  $('bookError').textContent = '';
+}
+async function confirmBooking(){
+  var iso = $('bookSlotIso') ? $('bookSlotIso').value : '';
+  var err = $('bookError'); err.textContent='';
+  if (!iso){ err.textContent = 'Please select an available slot.'; return; }
+  var when = new Date(iso);
+  if (isNaN(when.getTime())){ err.textContent='Invalid slot.'; return; }
+  if (when <= new Date()){ err.textContent='That slot is in the past. Please pick another.'; return; }
+  var btn = $('bookConfirm'); btn.disabled=true;
+  showOverlay('Booking your session & creating Meet link…');
+  try{
+    var res = await call('bookSession', { mentorId: $('bookMentorId').value, datetime: when.toISOString() });
+    bookModal.hide();
+    toast('Booked '+res.sessionNo+' ✓ Meet link & invite sent.','success');
+    await refreshSessions();
+    showView('dashboard');
+  }catch(e){ err.textContent = errMsg(e); }
+  finally{ hideOverlay(); btn.disabled=false; }
+}
+async function refreshSessions(){
+  var data = await call('getDashboardData');
+  if (data.authorized){ STATE.sessions = data.sessions; STATE.summary = data.summary; }
+}
+/* Student nudges the mentor to submit their (still-pending) feedback. */
+async function remindMentor(row){
+  showOverlay('Sending reminder…');
+  try{
+    var res = await call('remindMentorFeedback', row);
+    hideOverlay();
+    toast(res.already ? 'Mentor has already submitted feedback.' : 'Reminder sent to the mentor ✓', 'success');
+  }catch(e){ hideOverlay(); toast(errMsg(e),'danger'); }
+}
+/* Student marks a meeting complete (their half of the mutual agreement). */
+async function markComplete(row){
+  showOverlay('Marking complete…');
+  try{
+    var res = await call('markStudentComplete', row);
+    hideOverlay();
+    toast(res.bothCompleted ? 'Meeting marked complete by both parties ✓'
+                            : 'Marked complete ✓ Mentor notified to confirm & give feedback.', 'success');
+    await refreshSessions();
+    showView('dashboard');
+  }catch(e){ hideOverlay(); toast(errMsg(e),'danger'); }
+}
+/* ============ Student feedback ============ */
+function openFeedbackRow(row, sessionNo){
+  $('fbSessionRow').value = row;
+  $('fbSessionInfo').textContent = (sessionNo||('session #'+row));
+  $('fbText').value = '';
+  setStars('fbStars','fbRating',0);
+  $('fbError').textContent = '';
+  fbModal.show();
+}
+async function submitFeedback(){
+  var row = $('fbSessionRow').value;
+  var text = $('fbText').value.trim();
+  var rating = Number($('fbRating').value);
+  var err = $('fbError'); err.textContent='';
+  if (!text){ err.textContent='Please write your feedback.'; return; }
+  if (!(rating>=1 && rating<=5)){ err.textContent='Please give a rating (1–5).'; return; }
+  var btn = $('fbSubmit'); btn.disabled=true; showOverlay('Saving feedback…');
+  try{
+    await call('submitStudentFeedback', row, text, rating);
+    fbModal.hide();
+    toast('Feedback submitted ✓ You can now book again.','success');
+    await refreshSessions();
+    showView('dashboard');
+  }catch(e){ err.textContent = errMsg(e); }
+  finally{ hideOverlay(); btn.disabled=false; }
+}
+/* ============ Star rating widget ============ */
+function buildStars(containerId, targetId){
+  var c = $(containerId); c.innerHTML='';
+  for (var i=1;i<=5;i++){
+    var star = document.createElement('i');
+    star.className = 'bi bi-star-fill'; star.dataset.val = i;
+    star.addEventListener('click', function(){ setStars(containerId, targetId, Number(this.dataset.val)); });
+    c.appendChild(star);
+  }
+}
+function setStars(containerId, targetId, val){
+  $(targetId).value = val;
+  $(containerId).querySelectorAll('.bi').forEach(function(st){
+    st.classList.toggle('on', Number(st.dataset.val) <= val); });
+}
+/* ============ Mentor feedback page (standalone) ============ */
+async function renderMentorFeedback(sid){
+  $('appNav').style.display='none';
+  showOverlay('Loading…');
+  try{
+    var ctx = await call('getMentorFeedbackContext', sid);
+    hideOverlay();
+    if (!ctx.authorized){
+      app().innerHTML = '<div class="card access-denied text-center p-4">'+
+        '<div class="display-1 text-danger"><i class="bi bi-shield-lock"></i></div>'+
+        '<h3>Not authorized</h3>'+
+        '<p class="text-muted">This feedback link is for the assigned mentor of this session.</p>'+
+        '<div class="mt-3 p-3 rounded-4 bg-white bg-opacity-10 border border-white border-opacity-10 text-start" style="max-width:460px;margin:0 auto;">'+
+          '<div class="small mb-1">Signed in as: <b class="text-white">'+esc(ctx.activeEmail||'(no email detected)')+'</b></div>'+
+          '<div class="small">This session’s mentor: <b class="text-white">'+esc(ctx.expectedEmail||'(mentor not found)')+'</b></div>'+
+        '</div>'+
+        '<p class="text-muted small mt-3">Open this link signed in as the mentor’s account.</p></div>';
+      return;
+    }
+    if (ctx.alreadySubmitted){
+      app().innerHTML = '<div class="card access-denied text-center p-4">'+
+        '<div class="display-1 text-success"><i class="bi bi-check2-circle"></i></div>'+
+        '<h3>Feedback already submitted</h3><p class="text-muted">Thank you — your feedback for this session is recorded.</p></div>';
+      return;
+    }
+    var infoBlock =
+      '<div class="p-3 mb-4 rounded-4 bg-white bg-opacity-10 border border-white border-opacity-10">'+
+        '<div class="mb-2 fs-7"><span class="text-muted uppercase fw-semibold">Student:</span> <span class="text-white fw-bold">'+esc(ctx.studentName)+'</span> <span class="text-muted">('+esc(ctx.studentEmail)+')</span></div>'+
+        '<div class="mb-2 fs-7"><span class="text-muted uppercase fw-semibold">Session:</span> <span class="text-white fw-bold">'+esc(ctx.sessionNo)+'</span></div>'+
+        '<div class="fs-7"><span class="text-muted uppercase fw-semibold">Date & Time:</span> <span class="text-white fw-bold">'+fmtDT(ctx.datetime)+'</span></div>'+
+      '</div>';
+    // Step 1 — mentor confirms the meeting took place (their half of the agreement)
+    if (!ctx.mentorCompleted){
+      app().innerHTML =
+        '<div class="card access-denied p-4" style="max-width:550px;">'+
+        '<h4 class="mb-4 d-flex align-items-center"><i class="bi bi-check2-circle text-primary me-2"></i>Confirm Session</h4>'+
+        infoBlock +
+        '<p class="text-muted small">Please confirm this meeting took place. Once <b class="text-white">both you and the student</b> confirm, the feedback form unlocks.</p>'+
+        '<button class="btn btn-primary w-100 mt-2" id="confirmComplete"><i class="bi bi-check2 me-2"></i>I confirm this meeting is complete</button>'+
+        '</div>';
+      $('confirmComplete').addEventListener('click', function(){ confirmMentorComplete(ctx.sessionRow); });
+      return;
+    }
+    // Step 2 — mentor confirmed, waiting on the student
+    if (!ctx.studentCompleted){
+      app().innerHTML =
+        '<div class="card access-denied text-center p-4" style="max-width:550px;">'+
+        '<div class="display-1 text-warning"><i class="bi bi-hourglass-split"></i></div>'+
+        '<h3 class="text-white">Waiting for the student</h3>'+
+        '<p class="text-muted mt-3">You\'ve confirmed this meeting is complete. Once the <b class="text-white">student</b> also marks it complete from their dashboard, you\'ll be able to leave feedback here.</p>'+
+        '</div>';
+      return;
+    }
+    // Step 3 — both confirmed → feedback form
+    app().innerHTML =
+      '<div class="card access-denied p-4" style="max-width:550px;">'+
+      '<h4 class="mb-4 d-flex align-items-center"><i class="bi bi-chat-square-text text-primary me-2"></i>Mentor Feedback</h4>'+
+      '<div class="p-3 mb-4 rounded-4 bg-white bg-opacity-10 border border-white border-opacity-10">'+
+        '<div class="mb-2 fs-7"><span class="text-muted uppercase fw-semibold">Student:</span> <span class="text-white fw-bold">'+esc(ctx.studentName)+'</span> <span class="text-muted">('+esc(ctx.studentEmail)+')</span></div>'+
+        '<div class="mb-2 fs-7"><span class="text-muted uppercase fw-semibold">Session:</span> <span class="text-white fw-bold">'+esc(ctx.sessionNo)+'</span></div>'+
+        '<div class="fs-7"><span class="text-muted uppercase fw-semibold">Date & Time:</span> <span class="text-white fw-bold">'+fmtDT(ctx.datetime)+'</span></div>'+
+      '</div>'+
+      '<div class="mb-3">'+
+        '<label class="form-label text-muted small fw-semibold">YOUR FEEDBACK</label>'+
+        '<textarea class="form-control form-control-dark" id="mfText" rows="4" placeholder="Share your feedback with the student..."></textarea>'+
+      '</div>'+
+      '<div class="mb-3">'+
+        '<label class="form-label text-muted small fw-semibold d-block">RATING</label>'+
+        '<div class="rating" id="mfStars"></div><input type="hidden" id="mfRating" value="0">'+
+      '</div>'+
+      '<div class="text-danger small mt-2 fw-medium" id="mfError"></div>'+
+      '<button class="btn btn-primary w-100 mt-2" id="mfSubmit"><i class="bi bi-send me-2"></i>Submit Feedback</button>'+
+      '</div>';
+    buildStars('mfStars','mfRating');
+    $('mfSubmit').addEventListener('click', function(){ submitMentorFb(ctx.sessionRow); });
+  }catch(e){ hideOverlay(); toast(errMsg(e),'danger'); }
+}
+async function confirmMentorComplete(row){
+  showOverlay('Confirming…');
+  try{
+    await call('markMentorComplete', row);
+    hideOverlay();
+    renderMentorFeedback(row);   // re-render: unlocks feedback if student also confirmed
+  }catch(e){ hideOverlay(); toast(errMsg(e),'danger'); }
+}
+async function submitMentorFb(row){
+  var text = $('mfText').value.trim();
+  var rating = Number($('mfRating').value);
+  var err = $('mfError'); err.textContent='';
+  if (!text){ err.textContent='Please write your feedback.'; return; }
+  if (!(rating>=1 && rating<=5)){ err.textContent='Please give a rating (1–5).'; return; }
+  var btn = $('mfSubmit'); btn.disabled=true; showOverlay('Saving…');
+  try{
+    await call('submitMentorFeedback', row, text, rating);
+    hideOverlay();
+    app().innerHTML = '<div class="card access-denied text-center p-4">'+
+      '<div class="display-1 text-success"><i class="bi bi-check2-circle"></i></div>'+
+      '<h3>Thank you!</h3><p class="text-muted">Your feedback has been recorded.</p></div>';
+  }catch(e){ hideOverlay(); err.textContent = errMsg(e); btn.disabled=false; }
+}
+</script>
