@@ -9,14 +9,19 @@ integrated with **Google Calendar**, **Zoom**, and **Gmail**.
 
 > **One-line:** *Discover → book a slot → meet → review → it's all recorded.*
 
+### 🔗 Open the live app
+**https://script.google.com/macros/s/AKfycbxXt9VANAf6ae6YUsp3uOUfONYFZET4BmuMMUWaXoPFOJ5JILb0Mg6GZgm-xVK3UDEG8w/exec**
+
+Sign in with a registered student account — e.g. the reviewer's `shanmuga@ssb.scaler.com`.
+
 ---
 
 ## Submission links
 
-| Item | Where |
+| Item | Link |
 |---|---|
-| **Working application URL** | The Apps Script Web App `/exec` URL (deployed; access: *Anyone*) |
-| **Source code** | This repository (`Code.gs`, `index.html`, `styles.html`, `javascript.html`, `appsscript.json`) |
+| **Live application (dashboard)** | https://script.google.com/macros/s/AKfycbxXt9VANAf6ae6YUsp3uOUfONYFZET4BmuMMUWaXoPFOJ5JILb0Mg6GZgm-xVK3UDEG8w/exec |
+| **Source code repository** | https://github.com/sahildash100-hue/ssb-mentorship-portal |
 | **Architecture overview** | [`ARCHITECTURE.md`](ARCHITECTURE.md) |
 | **Setup instructions** | This file (below) |
 | **Key product & technical decisions** | [`DECISIONS.md`](DECISIONS.md) |
